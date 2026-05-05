@@ -1,0 +1,373 @@
+---
+title: "Building a 3D ring configurator in Expo"
+description: "A React-Native-first take on the classic R3F ring configurator: GLB loading on device, four metal materials, gesture-driven rotation, Zustand state, and ARKit / ARCore preview — all behind one Expo build."
+date: "2026-05-05"
+tags: ["expo", "react-native", "three.js", "r3f", "webgl", "ar", "shaders"]
+author: "Jean Rojas"
+---
+
+The web version of this demo is sitting on my [home page](/) — drag the diamond ring, watch the chromatic-aberration sparkle, all running on `@react-three/fiber` + drei. It works because desktop GPUs eat that geometry for breakfast.
+
+Phones are a different planet. expo-gl gives you GLES 3.0, the JS thread does double duty as the render thread, every megabyte of GLB is a megabyte the user paid for on their data plan, and a sustained 60fps is something you earn, not assume. This post is the recipe I use when a client wants the configurator on iOS *and* Android, doesn't want a webview, and asks for AR try-on as a stretch goal.
+
+Inspired by Michael Durkin&rsquo;s great [web walkthrough](https://blog.michael-durkin.com/ring-configurator-three-js-r3f-drei-web-xr-gsap-zustand-vite/), but everything below is Expo-specific.
+
+## The shape of the runtime
+
+Three rules that travel well from web R3F into mobile R3F:
+
+1. **Load once, render many.** GLB parsing is expensive on RN's JS thread. Cache the parsed scene in a module-level ref keyed by URL.
+2. **Gestures live on the UI thread.** Anything you tween from a finger has to run inside a Reanimated worklet, otherwise the JS bridge will eat your frame budget the moment something else allocates.
+3. **One renderer, two presentation modes.** The "preview" view (ring on a pedestal) and the "AR" view (ring on the user's hand) share a scene, just swap cameras + lights.
+
+```bash
+npx create-expo-app ring-configurator -t blank-typescript
+cd ring-configurator
+
+npx expo install expo-gl expo-three expo-asset expo-file-system \
+  expo-three-ar three @react-three/fiber@9 \
+  react-native-gesture-handler react-native-reanimated zustand
+```
+
+`expo-three-ar` is optional; only install it if you're shipping the AR view. It pulls in ARKit / ARCore native modules and bumps your binary by ~6MB.
+
+## Loading the GLB on device
+
+The web sends `useGLTF("/models/ring.glb")` and is done. On RN, `fetch()` doesn't return an `ArrayBuffer` you can hand to `GLTFLoader` directly — you have to go through `expo-asset` so the file ends up on the device's actual filesystem first.
+
+```tsx title="lib/loadGltf.ts" showLineNumbers
+import { Asset } from "expo-asset";
+import * as FileSystem from "expo-file-system";
+import { GLTFLoader } from "three-stdlib";
+import { DRACOLoader } from "three-stdlib";
+
+const decoder = new DRACOLoader();
+decoder.setDecoderPath(
+  // bundled via metro-config — see the metro section below
+  "https://cdn.jsdelivr.net/npm/three@0.171.0/examples/jsm/libs/draco/"
+);
+
+const cache = new Map<number, ReturnType<GLTFLoader["loadAsync"]>>();
+
+export async function loadGltf(moduleId: number) {
+  if (cache.has(moduleId)) return cache.get(moduleId)!;
+
+  const asset = Asset.fromModule(moduleId);
+  await asset.downloadAsync();
+  const localUri = asset.localUri ?? asset.uri;
+
+  // RN needs the binary as ArrayBuffer; FileSystem reads it as base64.
+  const base64 = await FileSystem.readAsStringAsync(localUri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+  const buffer = decodeBase64(base64);
+
+  const loader = new GLTFLoader();
+  loader.setDRACOLoader(decoder);
+  const promise = loader.parseAsync(buffer, "");
+  cache.set(moduleId, promise);
+  return promise;
+}
+
+function decodeBase64(b64: string): ArrayBuffer {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+```
+
+Two things to notice:
+
+- `Asset.fromModule` uses a Metro module ID — `require("../assets/ring.glb")` returns one. That means the GLB is bundled by Metro and shipped inside your app, which is what you want for a configurator (zero network round-trips on first paint).
+- The DRACO decoder runs as a WebAssembly module loaded from CDN. If you need offline-first, vendor the decoder into `assets/` and serve it from a local HTTP server during dev — slower to set up, faster on first launch.
+
+## Configuring Metro for binary assets
+
+Metro doesn&rsquo;t treat `.glb` / `.hdr` as bundle-able by default. Add them to the config:
+
+```js title="metro.config.js"
+const { getDefaultConfig } = require("expo/metro-config");
+
+const config = getDefaultConfig(__dirname);
+config.resolver.assetExts.push("glb", "gltf", "hdr", "exr", "bin");
+module.exports = config;
+```
+
+That single line is the difference between "your bundle works" and "your bundle silently 404s on physical devices but works in the simulator". Don&rsquo;t skip it.
+
+## The Zustand store
+
+Configuration state lives outside React because we want gesture worklets to read it without a render cycle.
+
+```ts title="store/ring.ts" showLineNumbers
+import { create } from "zustand";
+
+export type Metal = "gold" | "white-gold" | "rose-gold" | "platinum";
+export type Stone = "diamond" | "emerald" | "ruby" | "sapphire";
+
+type State = {
+  metal: Metal;
+  stone: Stone;
+  engraving: string;
+  rotation: number; // radians
+  setMetal: (m: Metal) => void;
+  setStone: (s: Stone) => void;
+  setEngraving: (e: string) => void;
+  setRotation: (r: number) => void;
+};
+
+export const useRing = create<State>((set) => ({
+  metal: "gold",
+  stone: "diamond",
+  engraving: "",
+  rotation: 0,
+  setMetal: (metal) => set({ metal }),
+  setStone: (stone) => set({ stone }),
+  setEngraving: (engraving) => set({ engraving: engraving.slice(0, 24) }),
+  setRotation: (rotation) => set({ rotation }),
+}));
+```
+
+The `rotation` value lives here so the AR view, the preview view, and any thumbnail snapshot can all read the same orientation. We&rsquo;ll write to it from a Reanimated worklet via `runOnJS` later.
+
+## The R3F scene (mobile)
+
+`@react-three/fiber` v9 ships a native build that wraps an `expo-gl` `GLView` instead of a `<canvas>`. The component tree feels almost identical to the web version — what changes is what you can&rsquo;t use.
+
+Things that work on RN:
+- `<mesh>`, `<group>`, `<perspectiveCamera>`, lights, `<primitive>`
+- Most drei primitives that don&rsquo;t depend on the DOM (`<Center>`, `<Float>`)
+- HDR environment via `RGBELoader` from `three-stdlib`
+
+Things that don&rsquo;t:
+- Anything that uses CSS / DOM events (`<Html>`, `<PresentationControls>` — drop these)
+- `MeshRefractionMaterial` from drei (it ships a glsl shader assuming WebGL2 features that GLES 3.0 doesn't always provide on Android)
+
+```tsx title="components/RingScene.tsx" showLineNumbers
+import { Canvas } from "@react-three/fiber/native";
+import { Suspense } from "react";
+import * as THREE from "three";
+import { Center } from "@react-three/drei/native";
+import { Ring } from "./Ring";
+import { Lights } from "./Lights";
+
+export default function RingScene() {
+  return (
+    <Canvas
+      camera={{ position: [0, 0, 4], fov: 35 }}
+      gl={{ antialias: true, powerPreference: "high-performance" }}
+      dpr={[1, 2]} // cap pixel ratio so older Androids don't melt
+    >
+      <color attach="background" args={["#0c0c0c"]} />
+      <Lights />
+      <Suspense fallback={null}>
+        <Center top>
+          <Ring />
+        </Center>
+      </Suspense>
+    </Canvas>
+  );
+}
+```
+
+`dpr={[1, 2]}` is the single most impactful flag for mid-range Android. The default is `window.devicePixelRatio` which on a Pixel 7 is 2.625 — your fragment shader runs ~7× the work for an imperceptible quality bump.
+
+## Material swapping
+
+The four metal options are just four `MeshStandardMaterial` configs. Looking up a single object beats branching a switch every frame.
+
+```ts title="components/Ring.tsx" showLineNumbers
+import { useEffect, useMemo, useRef } from "react";
+import * as THREE from "three";
+import { Asset } from "expo-asset";
+import { useRing, type Metal } from "../store/ring";
+import { loadGltf } from "../lib/loadGltf";
+
+const RING_GLB = require("../assets/ring.glb");
+
+const METAL: Record<Metal, THREE.MeshStandardMaterialParameters> = {
+  gold: { color: "#f6d27a", metalness: 1, roughness: 0.18 },
+  "white-gold": { color: "#e8e6df", metalness: 1, roughness: 0.22 },
+  "rose-gold": { color: "#e0a896", metalness: 1, roughness: 0.2 },
+  platinum: { color: "#cfd2d3", metalness: 1, roughness: 0.14 },
+};
+
+export function Ring() {
+  const ref = useRef<THREE.Group>(null);
+  const metal = useRing((s) => s.metal);
+  const rotation = useRing((s) => s.rotation);
+
+  // Resolve the GLB once. `Suspense` boundaries play nicely with this
+  // because the loader caches its promise.
+  const gltf = useGltf(RING_GLB);
+
+  // Tween-friendly material, recreated only when the metal changes.
+  const bandMaterial = useMemo(
+    () => new THREE.MeshStandardMaterial(METAL[metal]),
+    [metal]
+  );
+
+  // Apply the material to the band mesh. The ring GLB exports two children:
+  //   ring.geometry  → the band
+  //   diamonds.geometry → the stone setting
+  useEffect(() => {
+    gltf.scene.traverse((obj) => {
+      if (obj instanceof THREE.Mesh && obj.name === "ring") {
+        obj.material = bandMaterial;
+      }
+    });
+  }, [gltf, bandMaterial]);
+
+  // Drive rotation from the store — gesture handler writes into it.
+  useFrame(() => {
+    if (ref.current) ref.current.rotation.y = rotation;
+  });
+
+  return <primitive object={gltf.scene} ref={ref} scale={1.4} />;
+}
+```
+
+`useGltf` is a tiny suspense-friendly wrapper around the loader from earlier — three lines, omitted for space.
+
+## The diamond, on a budget
+
+The web version uses `MeshRefractionMaterial` with a cube map and chromatic aberration. On native, that fragment shader is too heavy for sustained 60fps on anything below an A14 / Snapdragon 8 Gen 1.
+
+The compromise I ship: a `MeshPhysicalMaterial` with `transmission`, `ior: 2.418`, `roughness: 0`, `clearcoat: 1`, plus a low-res environment map. You lose the rainbow fringes but keep the depth-of-refraction look, and you don&rsquo;t drop frames.
+
+```ts
+const stoneMaterial = new THREE.MeshPhysicalMaterial({
+  color: "#ffffff",
+  transmission: 1,
+  thickness: 0.8,
+  ior: 2.418,
+  roughness: 0,
+  metalness: 0,
+  clearcoat: 1,
+  clearcoatRoughness: 0,
+  envMapIntensity: 2.4,
+});
+```
+
+If your client absolutely needs the chromatic dispersion, ship it as a GIF preview generated server-side from the web version, and gate the AR view behind a feature flag for the top tier of devices via `react-native-device-info`.
+
+## Gesture-driven rotation
+
+This is where Expo actually wins compared to a web canvas. RN&rsquo;s gesture handler runs on the UI thread; the rotation update never crosses the JS bridge until the gesture ends.
+
+```tsx title="components/RingViewer.tsx" showLineNumbers
+import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import { runOnJS, useSharedValue } from "react-native-reanimated";
+import { useRing } from "../store/ring";
+import RingScene from "./RingScene";
+
+export default function RingViewer() {
+  const start = useSharedValue(0);
+  const setRotation = useRing((s) => s.setRotation);
+
+  const pan = Gesture.Pan()
+    .onStart(() => {
+      start.value = useRing.getState().rotation;
+    })
+    .onUpdate((e) => {
+      const next = start.value + e.translationX * 0.01;
+      runOnJS(setRotation)(next);
+    });
+
+  return (
+    <GestureDetector gesture={pan}>
+      <RingScene />
+    </GestureDetector>
+  );
+}
+```
+
+`useRing.getState()` reads the store from inside a worklet without subscribing — Zustand is happy with this because the store is a plain JS object on the JS realm. We only `runOnJS` the write.
+
+If you need pinch-to-zoom, layer a `Gesture.Pinch()` and `Gesture.Simultaneous()` so the two work together. Don&rsquo;t use `Gesture.Race()` — it chooses one and ignores the other.
+
+## The AR view
+
+ARKit (iOS) and ARCore (Android) both expose a "place this object on a detected surface" API. `expo-three-ar` wraps both behind one renderer.
+
+```tsx title="components/ARView.tsx" showLineNumbers
+import { GLView } from "expo-gl";
+import { Renderer } from "expo-three";
+import * as THREE from "three";
+import { ExpoWebGLRenderingContext } from "expo-gl";
+
+export default function ARView() {
+  const onContextCreate = async (gl: ExpoWebGLRenderingContext) => {
+    const renderer = new Renderer({ gl });
+    renderer.setClearColor(0x000000, 0); // transparent — show camera
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(70, 1, 0.01, 100);
+
+    // ARKit / ARCore push pose updates into the camera every frame
+    const ar = await import("expo-three-ar");
+    await ar.start({ session: "world", planeDetection: "horizontal" });
+
+    ar.onPoseUpdated((pose) => {
+      camera.matrix.fromArray(pose.matrix);
+      camera.matrixWorldNeedsUpdate = true;
+    });
+
+    // Same Ring component as the preview, just placed on the first
+    // detected plane.
+    ar.onPlaneDetected((plane) => {
+      const ring = await loadRing(); // your loader
+      ring.position.set(plane.x, plane.y, plane.z);
+      scene.add(ring);
+    });
+
+    const tick = () => {
+      renderer.render(scene, camera);
+      gl.endFrameEXP();
+      requestAnimationFrame(tick);
+    };
+    tick();
+  };
+
+  return <GLView style={{ flex: 1 }} onContextCreate={onContextCreate} />;
+}
+```
+
+Two practical limits worth flagging:
+- ARKit / ARCore needs camera permission. Ask for it upfront on a "Try it on" CTA, not on app launch — denial rates triple if you ask without context.
+- The user&rsquo;s lighting becomes your scene&rsquo;s lighting. The gold material you tuned in a studio HDR will look *brassy* in a yellow-lamp kitchen. Either ship a live light estimation pass (`ar.onLightingUpdated` returns a spherical-harmonics ambient term) or keep the AR view&rsquo;s look intentionally stylised.
+
+## The configurator UI
+
+Material picker, stone picker, engraving input — all plain RN, sitting *over* the GLView in a `<SafeAreaView>` with `pointerEvents="box-none"` so finger drags pass through to the gesture handler beneath.
+
+```tsx
+<View style={StyleSheet.absoluteFill} pointerEvents="box-none">
+  <RingViewer />
+  <View style={s.bottomBar} pointerEvents="auto">
+    <MetalPicker />
+    <StonePicker />
+    <EngravingInput />
+  </View>
+</View>
+```
+
+`pointerEvents="box-none"` on the parent says "don&rsquo;t catch touches yourself, but let your children catch them." That single prop is the difference between a configurator that feels native and one that feels like a webview.
+
+## Performance dial
+
+In rough order of impact on a $400 Android:
+
+1. `dpr={[1, 2]}` on the Canvas — mentioned above, biggest single win
+2. Pre-bake your environment map to a 256² cubemap, ship it as a `.hdr` next to the GLB
+3. Compress the GLB with Draco (lossy quantisation, ~6× smaller geometry)
+4. Disable shadows on the ring; use a baked AO map on the band texture instead
+5. Throttle `onPoseUpdated` to 30Hz with `setInterval` — ARKit reports at 60Hz and the extra frames buy you nothing for a static object
+
+## Where to next
+
+- Swap `MeshPhysicalMaterial` for a hand-rolled `ShaderMaterial` with chromatic aberration once you&rsquo;ve gated by device tier
+- Tween between `metal` selections via `react-native-reanimated`'s `withSpring` on the material&rsquo;s color/roughness uniforms — feels a lot more confident than a snap swap
+- Snapshot exports: render the scene to an offscreen FBO via `expo-gl`'s `takeSnapshotAsync` and `expo-sharing` it as the user&rsquo;s lock-screen, the way Cartier&rsquo;s app does
+
+The web version that lives on my home page is ~3× the polygon count of the mobile build because I can afford it on a desktop GPU. The Expo build wins on touch, AR, and being one swipe away from purchase. Pick the right tool for the surface you&rsquo;re shipping to.
